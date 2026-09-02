@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import signal
@@ -13,7 +14,7 @@ from app.core.image_processing import (
     crop_rois,
 )
 
-from app.core.chandra_ocr_engine import run_chandra_ocr, warmup as chandra_warmup
+from app.core.qwen_ocr_client import run_qwen_ocr
 from app.core.smart_parser import parse_smart
 from app.core.constituency_resolver import resolve_constituency
 
@@ -25,25 +26,25 @@ _stop_event = threading.Event()
 
 
 def _handle_shutdown(signum, frame):
-    print(f"\n🛑 Worker received signal {signum} — shutting down cleanly...")
+    print(f"\n[STOP] Worker received signal {signum} - shutting down cleanly...")
     _stop_event.set()
 
 
 def process_job(job: Job, db: Session):
-    print(f"🚀 Processing job: {job.id}")
+    print(f"[START] Processing job: {job.id}")
 
     try:
         # 1. Download image
-        print("⬇️ Downloading image...")
+        print("[INFO] Downloading image...")
         image = download_image(job.image_path)
-        print("✅ Image downloaded")
+        print("[OK] Image downloaded")
 
         # 2. Process image
         if job.is_cropped:
-            print("🟢 Cropped image → using as-is")
+            print("[INFO] Cropped image -> using as-is")
             processed = image
         else:
-            print("🟡 Not cropped → ROI processing")
+            print("[INFO] Not cropped -> ROI processing")
 
             top_left, form_section = crop_rois(image)
 
@@ -53,17 +54,34 @@ def process_job(job: Job, db: Session):
 
             processed = cv2.vconcat([top_left_resized, form_section_resized])
 
-        # 3. Run ChandraOCR
-        print("🧠 Calling ChandraOCR...")
-        ocr_text = run_chandra_ocr(processed)
-        print("📄 OCR text received")
+        # 3. Run Qwen OCR
+        print("[INFO] Calling Qwen OCR...")
+        qwen_json = run_qwen_ocr(processed)
+        print("[INFO] Qwen JSON received")
 
-        # 4. Parse — always keep result even if name is missing
-        parsed = parse_smart(ocr_text)
+        # 4. Map to expected parsed format
+        def _fmt(val):
+            return {"value": val if val else None, "confidence": 0.99 if val else 0.0}
+
+        parsed = {
+            "name": _fmt(qwen_json.get("voter_name")),
+            "epic": _fmt(qwen_json.get("epic_number")),
+            "mobile": _fmt(qwen_json.get("mobile_number")),
+            "serial_number": _fmt(qwen_json.get("serial_number")),
+            "part_number_and_name": _fmt(qwen_json.get("part_number_name")),
+            "assembly_constituency": _fmt(qwen_json.get("constituency")),
+            "district": _fmt(None),
+            "state": _fmt(qwen_json.get("state")),
+            "address": _fmt(qwen_json.get("address")),
+        }
+        
+        # We need raw_text to remain for job.result backwards compatibility, we'll store JSON string
+        ocr_text = json.dumps(qwen_json, ensure_ascii=False)
+
         if parsed.get("name", {}).get("value"):
-            print("✅ Parser succeeded")
+            print("[OK] Qwen mapping succeeded")
         else:
-            print("⚠️ Parser: name not found (partial result saved)")
+            print("[WARN] Qwen mapping: name not found (partial result saved)")
 
         # 4b. Resolve constituency against DB
         ac_raw = parsed.get("assembly_constituency", {}).get("value")
@@ -90,13 +108,13 @@ def process_job(job: Job, db: Session):
         }
 
     except Exception as e:
-        print(f"❌ ERROR: {str(e)}")
+        print(f"[ERROR]: {str(e)}")
         job.status = "failed"
         job.error_message = str(e)
 
     db.commit()
 
-    print(f"🏁 Job finished: {job.id} → {job.status}")
+    print(f"[DONE] Job finished: {job.id} -> {job.status}")
 
 
 def worker():
@@ -107,10 +125,9 @@ def worker():
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 
-    print("🚀 Worker started...", flush=True)
+    print("Worker started...", flush=True)
 
-    # Pre-load ChandraOCR model before picking up jobs
-    chandra_warmup()
+    # Qwen OCR is a remote service; no warmup needed locally.
 
     # Register signal handlers so PaddlePaddle's C++ backend gets a chance
     # to release resources before the process exits — prevents crashes on
@@ -133,30 +150,34 @@ def worker():
             )
 
             if not job:
-                print("😴 No pending jobs...")
-                _stop_event.wait(timeout=POLL_INTERVAL)
-                continue
-
-            job.status = "processing"
-            db.commit()
-            db.refresh(job)
-
-            try:
-                process_job(job, db)
-
-            except Exception as e:
-                print(f"❌ Error processing job {job.id}: {str(e)}")
-                db.rollback()
-                job.status = "failed"
-                job.error_message = str(e)
+                print("[IDLE] No pending jobs...")
+            else:
+                job.status = "processing"
                 db.commit()
+                db.refresh(job)
+
+                try:
+                    process_job(job, db)
+
+                except Exception as e:
+                    print(f"[ERROR] Error processing job {job.id}: {str(e)}")
+                    db.rollback()
+                    job.status = "failed"
+                    job.error_message = str(e)
+                    db.commit()
+                    
+        except Exception as e:
+            print(f"[ERROR] Database error in worker loop: {str(e)}")
 
         finally:
-            db.close()
+            try:
+                db.close()
+            except Exception as e:
+                print(f"[ERROR] Error closing database session: {str(e)}")
 
         _stop_event.wait(timeout=POLL_INTERVAL)
 
-    print("✅ Worker stopped cleanly")
+    print("[OK] Worker stopped cleanly")
 
 
 if __name__ == "__main__":

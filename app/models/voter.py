@@ -10,7 +10,7 @@ from app.db.base import Base
 class Voter(Base):
     __tablename__ = "voters"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    id = Column(UUID(as_uuid=True), default=uuid.uuid4)
 
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), index=True)
 

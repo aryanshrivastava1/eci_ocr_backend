@@ -13,4 +13,4 @@ class Constituency(Base):
     district = Column("District", String, nullable=False, index=True)
     constituency_hindi = Column("Constituency_Hindi", String, nullable=False, index=True)
 
-    district_id = Column(Integer, ForeignKey("districts.id"))
+    district_id = Column(Integer, ForeignKey("districts.district_id"))

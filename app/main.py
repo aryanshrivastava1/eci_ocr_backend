@@ -50,6 +50,6 @@ def start_worker():
         from app.workers.colab_ocr_worker import worker
     else:
         from app.workers.ocr_worker import worker
-    print("🚀 Starting OCR worker...")
+    print("Starting OCR worker...")
     t = threading.Thread(target=worker, daemon=True)
     t.start()

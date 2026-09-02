@@ -34,6 +34,5 @@ def upload_image(file_bytes: bytes, user_id: str, job_id: str, filename: str):
     if not files:
         raise Exception("Upload verification failed: file not found in bucket")
 
-    public_url = supabase.storage.from_(BUCKET_NAME).get_public_url(file_path)
-
-    return public_url
+    # Return the file_path instead of public URL so worker can use SDK to download
+    return file_path

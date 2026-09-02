@@ -1,16 +1,23 @@
 import cv2
 import numpy as np
-import requests
 import os
+from supabase import create_client
+from app.core.config import settings
 
 
 def download_image(image_path: str):
-    response = requests.get(image_path)
+    # Initialize a fresh client for the worker thread to avoid stale keep-alive connections
+    local_supabase = create_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_SERVICE_ROLE_KEY
+    )
+    
+    try:
+        image_bytes = local_supabase.storage.from_("ocr-images").download(image_path)
+    except Exception as e:
+        raise Exception(f"Download failed: {str(e)}")
 
-    if response.status_code != 200:
-        raise Exception(f"Download failed: {response.status_code}")
-
-    image_array = np.frombuffer(response.content, np.uint8)
+    image_array = np.frombuffer(image_bytes, np.uint8)
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
 
     if image is None:

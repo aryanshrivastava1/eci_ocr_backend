@@ -26,11 +26,49 @@ def download_image(image_path: str):
     return image
 
 
+# Longest side the OCR service receives. Large enough to keep handwritten
+# digits legible, small enough to stay well inside the request timeout.
+MAX_EDGE = 2200
+
+# Small scans are upscaled to at least this, which measurably helps the model
+# on handwritten answer rows.
+MIN_EDGE = 1400
+
+
+def prepare_for_ocr(image: np.ndarray) -> np.ndarray:
+    """
+    Preserve the form's layout and send the WHOLE page.
+
+    Deliberately does not crop. The previous ROI approach cut the page at fixed
+    fractions (0-25% h x 0-60% w, then 25-55% h) and stacked the two panes,
+    which physically deleted the right-hand answer column — the mobile, Aadhaar
+    and guardian values live there — and destroyed the row alignment the model
+    needs to match an answer to its label. Scaling only; no crop, no aspect
+    change, no vconcat.
+    """
+    h, w = image.shape[:2]
+    longest = max(h, w)
+
+    if longest > MAX_EDGE:
+        scale = MAX_EDGE / longest
+    elif longest < MIN_EDGE:
+        scale = MIN_EDGE / longest
+    else:
+        return image
+
+    return cv2.resize(
+        image,
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+    )
+
+
 def crop_rois(image: np.ndarray):
     """
-    Crop required regions:
-    - top_left (structured data)
-    - form_section (mobile number area)
+    DEPRECATED — retained only so older call sites keep importing cleanly.
+
+    Do not use on the OCR path: the fixed fractions below delete the right-hand
+    answer column. Use prepare_for_ocr() instead.
     """
     h, w = image.shape[:2]
 

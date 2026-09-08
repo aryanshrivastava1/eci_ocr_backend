@@ -10,9 +10,12 @@ from app.db.session import SessionLocal
 from app.models.job import Job
 from app.db.base_model import *
 
-from app.core.image_processing import download_image, crop_rois
+from app.core.image_processing import download_image, prepare_for_ocr
 from app.core.smart_parser import parse_smart
-from app.core.constituency_resolver import resolve_constituency
+from app.core.field_validation import REVIEWABLE
+# Both workers share one mapping/validation/resolution path so they cannot
+# drift apart again.
+from app.workers.ocr_worker import apply_constituency_resolution, build_parsed
 
 import threading
 
@@ -76,50 +79,56 @@ def process_job(job: Job, db: Session):
         image = download_image(job.image_path)
         print("✅ Image downloaded")
 
-        # 2. Preprocess (same logic as the local worker)
-        if job.is_cropped:
-            print("🟢 Cropped image → using as-is")
-            processed = image
-        else:
-            print("🟡 Not cropped → ROI processing")
-            top_left, form_section = crop_rois(image)
-            w = max(top_left.shape[1], form_section.shape[1])
-            top_left_resized = cv2.resize(top_left, (w, top_left.shape[0]))
-            form_section_resized = cv2.resize(form_section, (w, form_section.shape[0]))
-            processed = cv2.vconcat([top_left_resized, form_section_resized])
+        # 2. Preprocess — full page, layout preserved, no cropping
+        processed = prepare_for_ocr(image)
+        print(f"🖼️ Sending full page {processed.shape[1]}x{processed.shape[0]} "
+              f"(cropped_upload={job.is_cropped})")
 
         # 3. Hit the Colab OCR server
         print(f"🌐 Sending image to Colab ({COLAB_OCR_URL})...")
         ocr_text = _call_colab_ocr(processed)
         print(f"📄 OCR text received ({len(ocr_text)} chars)")
 
-        # 4. Parse OCR output
-        parsed = parse_smart(ocr_text)
+        # 4. Parse OCR output, then run the SAME mapping + validation as the
+        #    Qwen worker so the two paths produce identical shapes.
+        smart = parse_smart(ocr_text)
+        model_fields = {
+            "voter_name": (smart.get("name") or {}).get("value"),
+            "epic_number": (smart.get("epic") or {}).get("value"),
+            "address": (smart.get("address") or {}).get("value"),
+            "serial_number": (smart.get("serial_number") or {}).get("value"),
+            "part_number_name": (smart.get("part_number_and_name") or {}).get("value"),
+            "constituency": (smart.get("assembly_constituency") or {}).get("value"),
+            "state": (smart.get("state") or {}).get("value"),
+            "district": (smart.get("district") or {}).get("value"),
+            "mobile_number": (smart.get("mobile") or {}).get("value"),
+        }
+        parsed = build_parsed(model_fields)
+        for f in parsed.values():
+            f["source"] = "regex"
+
+        # 4b. Annotate against the reference table — never overwrite OCR
+        apply_constituency_resolution(parsed, db)
+
+        flagged = [k for k, v in parsed.items() if v.get("status") in REVIEWABLE]
         if parsed.get("name", {}).get("value"):
-            print("✅ Parser succeeded")
+            print("✅ Parser succeeded"
+                  + (f" — confirm: {', '.join(flagged)}" if flagged else ""))
         else:
             print("⚠️ Parser: name not found (partial result saved)")
 
-        # 4b. Resolve constituency against DB
-        ac_raw = parsed.get("assembly_constituency", {}).get("value")
-        if ac_raw:
-            ac_hindi, district_hi = resolve_constituency(db, ac_raw)
-            if ac_hindi:
-                parsed["assembly_constituency"]["value"] = ac_hindi
-                parsed["assembly_constituency"]["confidence"] = 0.99
-                if district_hi and not parsed.get("district", {}).get("value"):
-                    district_hi = re.sub(r"^जिल[ाेोां]*\s*[:：]?\s*", "", district_hi).strip()
-                    parsed.setdefault("district", {})["value"] = district_hi
-                    parsed["district"]["confidence"] = 0.99
-            else:
-                parsed["assembly_constituency"]["value"] = None
-                parsed["assembly_constituency"]["confidence"] = 0.0
-
-        # 5. Persist result
+        # 5. Persist result — raw OCR text preserved verbatim
         job.status = "completed"
         job.result = {
             "raw_text": ocr_text,
             "parsed": parsed,
+            "ocr_meta": {
+                "raw_text": ocr_text,
+                "parse_mode": "smart_parser",
+                "parse_error": None,
+                "http_status": None,
+                "endpoint": COLAB_OCR_URL,
+            },
         }
 
     except Exception as e:

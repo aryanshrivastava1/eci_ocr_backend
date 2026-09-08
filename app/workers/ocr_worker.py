@@ -1,23 +1,23 @@
-import json
-import os
-import re
 import signal
 import threading
-import cv2
+
 from sqlalchemy.orm import Session
+
 from app.db.session import SessionLocal
 from app.models.job import Job
 from app.db.base_model import *
 
-from app.core.image_processing import (
-    download_image,
-    crop_rois,
-)
-
+from app.core.image_processing import download_image, prepare_for_ocr
 from app.core.qwen_ocr_client import run_qwen_ocr
-from app.core.smart_parser import parse_smart
 from app.core.constituency_resolver import resolve_constituency
-
+from app.core.extraction_schema import FIELDS, LEGACY_KEYS
+from app.core.field_validation import (
+    DB_CONFIRMED_CONFIDENCE,
+    NEEDS_REVIEW,
+    VERIFIED,
+    REVIEWABLE,
+    validate,
+)
 
 POLL_INTERVAL = 3  # seconds
 
@@ -30,6 +30,67 @@ def _handle_shutdown(signum, frame):
     _stop_event.set()
 
 
+def build_parsed(model_fields: dict) -> dict:
+    """
+    Map the model's response onto the schema and validate every field.
+
+    FIELDS is exactly the eight keys the app saves (plus the DB-derived
+    district), so `parsed` never carries fields the app has no use for.
+    """
+    raw = dict(model_fields or {})
+
+    parsed = {}
+    for spec in FIELDS:
+        parsed[spec.key] = validate(spec.key, raw.get(spec.model_key))
+
+    ordered = {k: parsed[k] for k in LEGACY_KEYS if k in parsed}
+    ordered.update({k: v for k, v in parsed.items() if k not in ordered})
+    return ordered
+
+
+def apply_constituency_resolution(parsed: dict, db: Session) -> None:
+    """
+    Annotate the constituency (and district) against the reference table.
+
+    Non-destructive by construction: the OCR value stays in place no matter
+    what the resolver concludes. A confirmed match is recorded alongside it as
+    `db_match`, and only a confirmed match may fill an EMPTY district.
+    """
+    ac = parsed.get("assembly_constituency") or {}
+    ac_value = ac.get("value")
+    if not ac_value:
+        return
+
+    match = resolve_constituency(db, ac_value)
+
+    ac["db_match"] = match.matched
+    ac["db_score"] = match.score
+    ac["db_status"] = match.status
+
+    if match.status == "confirmed":
+        # A reference-table hit IS a real check, so this is the one path on
+        # which a free-text field earns "verified".
+        ac["status"] = VERIFIED
+        ac["confidence"] = DB_CONFIRMED_CONFIDENCE
+        ac["note"] = None
+    else:
+        # Value preserved; the operator is told it was not DB-validated.
+        ac["status"] = NEEDS_REVIEW
+        ac["confidence"] = min(ac.get("confidence", 0.45), 0.45)
+        ac["note"] = match.note
+
+    district = parsed.get("district") or {}
+    if match.status == "confirmed" and match.district and not district.get("value"):
+        district.update({
+            "value": match.district,
+            "confidence": DB_CONFIRMED_CONFIDENCE,
+            "source": "db",
+            "status": "verified",
+            "note": f"derived from constituency '{match.matched}'",
+        })
+        parsed["district"] = district
+
+
 def process_job(job: Job, db: Session):
     print(f"[START] Processing job: {job.id}")
 
@@ -37,74 +98,40 @@ def process_job(job: Job, db: Session):
         # 1. Download image
         print("[INFO] Downloading image...")
         image = download_image(job.image_path)
-        print("[OK] Image downloaded")
+        print(f"[OK] Image downloaded ({image.shape[1]}x{image.shape[0]})")
 
-        # 2. Process image
-        if job.is_cropped:
-            print("[INFO] Cropped image -> using as-is")
-            processed = image
-        else:
-            print("[INFO] Not cropped -> ROI processing")
+        # 2. Preprocess — full page, layout preserved, no cropping
+        processed = prepare_for_ocr(image)
+        print(f"[INFO] Sending full page {processed.shape[1]}x{processed.shape[0]} "
+              f"(cropped_upload={job.is_cropped})")
 
-            top_left, form_section = crop_rois(image)
-
-            w = max(top_left.shape[1], form_section.shape[1])
-            top_left_resized = cv2.resize(top_left, (w, top_left.shape[0]))
-            form_section_resized = cv2.resize(form_section, (w, form_section.shape[0]))
-
-            processed = cv2.vconcat([top_left_resized, form_section_resized])
-
-        # 3. Run Qwen OCR
+        # 3. Run Qwen OCR — the verbatim response comes back with the fields
         print("[INFO] Calling Qwen OCR...")
-        qwen_json = run_qwen_ocr(processed)
-        print("[INFO] Qwen JSON received")
+        ocr = run_qwen_ocr(processed)
+        print(f"[INFO] Qwen response received "
+              f"({len(ocr.raw_text)} chars, mode={ocr.parse_mode})")
+        if ocr.parse_error:
+            print(f"[WARN] {ocr.parse_error}")
 
-        # 4. Map to expected parsed format
-        def _fmt(val):
-            return {"value": val if val else None, "confidence": 0.99 if val else 0.0}
+        # 4. Map onto the schema and validate every field
+        parsed = build_parsed(ocr.fields)
 
-        parsed = {
-            "name": _fmt(qwen_json.get("voter_name")),
-            "epic": _fmt(qwen_json.get("epic_number")),
-            "mobile": _fmt(qwen_json.get("mobile_number")),
-            "serial_number": _fmt(qwen_json.get("serial_number")),
-            "part_number_and_name": _fmt(qwen_json.get("part_number_name")),
-            "assembly_constituency": _fmt(qwen_json.get("constituency")),
-            "district": _fmt(None),
-            "state": _fmt(qwen_json.get("state")),
-            "address": _fmt(qwen_json.get("address")),
-        }
-        
-        # We need raw_text to remain for job.result backwards compatibility, we'll store JSON string
-        ocr_text = json.dumps(qwen_json, ensure_ascii=False)
+        # 4b. Annotate against the reference table — never overwrite OCR
+        apply_constituency_resolution(parsed, db)
 
+        flagged = [k for k, v in parsed.items() if v.get("status") in REVIEWABLE]
         if parsed.get("name", {}).get("value"):
-            print("[OK] Qwen mapping succeeded")
+            print(f"[OK] Extraction complete"
+                  + (f" — confirm: {', '.join(flagged)}" if flagged else ""))
         else:
-            print("[WARN] Qwen mapping: name not found (partial result saved)")
+            print("[WARN] Voter name not found (partial result saved)")
 
-        # 4b. Resolve constituency against DB
-        ac_raw = parsed.get("assembly_constituency", {}).get("value")
-        if ac_raw:
-            ac_hindi, district_hi = resolve_constituency(db, ac_raw)
-            if ac_hindi:
-                parsed["assembly_constituency"]["value"] = ac_hindi
-                parsed["assembly_constituency"]["confidence"] = 0.99
-                if district_hi and not parsed.get("district", {}).get("value"):
-                    district_hi = re.sub(r"^जिल[ाेोां]*\s*[:：]?\s*", "", district_hi).strip()
-                    parsed.setdefault("district", {})["value"] = district_hi
-                    parsed["district"]["confidence"] = 0.99
-            else:
-                # Resolver could not confirm (ambiguous or no match) — clear so
-                # the user knows to retake the image for a cleaner constituency scan
-                parsed["assembly_constituency"]["value"] = None
-                parsed["assembly_constituency"]["confidence"] = 0.0
-
-        # 5. Save result
+        # 5. Save result — the exact model response is preserved verbatim
         job.status = "completed"
         job.result = {
-            "raw_text": ocr_text,
+            "raw_text": ocr.raw_text,
             "parsed": parsed,
+            "ocr_meta": ocr.as_dict(),
         }
 
     except Exception as e:
@@ -129,9 +156,6 @@ def worker():
 
     # Qwen OCR is a remote service; no warmup needed locally.
 
-    # Register signal handlers so PaddlePaddle's C++ backend gets a chance
-    # to release resources before the process exits — prevents crashes on
-    # Ctrl+C or terminal close on macOS
     try:
         signal.signal(signal.SIGINT, _handle_shutdown)
         signal.signal(signal.SIGTERM, _handle_shutdown)
@@ -165,7 +189,7 @@ def worker():
                     job.status = "failed"
                     job.error_message = str(e)
                     db.commit()
-                    
+
         except Exception as e:
             print(f"[ERROR] Database error in worker loop: {str(e)}")
 

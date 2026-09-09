@@ -4,7 +4,8 @@ import math
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -15,7 +16,7 @@ from app.schemas.voter import VoterCreate
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.services.csv_service import generate_csv
-from app.services.vote_service import get_base_query
+from app.services.vote_service import apply_voter_filters, get_base_query
 from app.utils.success_response import success_response
 from app.utils.exceptions import AppException
 from app.schemas.voter_update_request import VoterUpdateRequest
@@ -23,108 +24,136 @@ from app.repositories.voter_repo import create_voter, delete_voter, get_total_vo
 
 router = APIRouter()
 
+# Fields a client is allowed to sort by. Anything else is rejected rather
+# than silently ignored.
+SORTABLE_FIELDS = {
+    "name": Voter.name,
+    "epic": Voter.epic,
+    "serial_number": Voter.serial_number,
+    "part_number_and_name": Voter.part_number_and_name,
+    "district_id": Voter.district_id,
+    "assembly_constituency_id": Voter.assembly_constituency_id,
+}
+
+
+def _collect_filters(**kwargs) -> dict:
+    """Drop unset filters so the response can echo only what was applied."""
+    return {k: v for k, v in kwargs.items() if v is not None and v != ""}
+
+
+def _serialize_voter(v: Voter) -> dict:
+    return {
+        "id": str(v.id),
+        "name": v.name,
+        "epic": v.epic,
+        "mobile": v.mobile,
+        "address": v.address,
+        "serial_number": v.serial_number,
+        "part_number_and_name": v.part_number_and_name,
+        "assembly_constituency_id": v.assembly_constituency_id,
+        "assembly_constituency_name": v.assembly_constituency_name,
+        "district": v.district,
+        "state": v.state,
+        "mandal_id": v.mandal_id,
+        "district_id": v.district_id,
+        "booth_id": v.booth_id,
+        "user_id": str(v.user_id),
+    }
+
+
+def _apply_sort(query, sort_by: str, sort_order: str):
+    column = SORTABLE_FIELDS.get(sort_by)
+
+    if column is None:
+        raise AppException(
+            status_code=400,
+            code="INVALID_SORT_FIELD",
+            message=(
+                "Invalid sort field. Allowed: "
+                + ", ".join(sorted(SORTABLE_FIELDS))
+            ),
+            field="sort_by",
+        )
+
+    if sort_order.lower() not in ("asc", "desc"):
+        raise AppException(
+            status_code=400,
+            code="INVALID_SORT_ORDER",
+            message="Invalid sort order. Allowed: asc, desc",
+            field="sort_order",
+        )
+
+    column = column.desc() if sort_order.lower() == "desc" else column.asc()
+
+    # Voter.id is appended as a tiebreaker: without a total order the same
+    # row can appear on two different pages.
+    return query.order_by(column, Voter.id.asc())
+
+
 @router.get("/getVoters")
 def get_voters(
-    epic: Optional[str] = None,
-    page: int = 1,
-    limit: int = 50,
+    name: Optional[str] = Query(None),
+    epic: Optional[str] = Query(None),
+    mobile: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    district_id: Optional[int] = Query(None),
+    mandal_id: Optional[int] = Query(None),
+    assembly_constituency_id: Optional[int] = Query(None),
+    booth_id: Optional[int] = Query(None),
+    part_number: Optional[str] = Query(None),
+    sort_by: str = Query("name"),
+    sort_order: str = Query("asc"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user),
 ):
     try:
-        if epic:
-            booth_id = current_user.booth_id
-
-            if not booth_id:
-                raise AppException(
-                    status_code=403,
-                    code="NO_BOOTH_ASSIGNED",
-                    message="Your account has no booth assigned"
-                )
-
-            query = (
-                db.query(Voter)
-                .filter(
-                    Voter.epic.ilike(f"%{epic.strip()}%"),
-                    Voter.booth_id == booth_id
-                )
-            )
-
-            total = query.count()
-
-            if total == 0:
-                from fastapi.responses import Response
-                return Response(status_code=204)
-
-            total_pages = math.ceil(total / limit) if limit > 0 else 1
-            offset = (page - 1) * limit
-            voters = query.offset(offset).limit(limit).all()
-
-            return success_response(
-                data={
-                    "voters": [
-                        {
-                            "id": str(v.id),
-                            "name": v.name,
-                            "epic": v.epic,
-                            "mobile": v.mobile,
-                            "address": v.address,
-                            "serial_number": v.serial_number,
-                            "part_number_and_name": v.part_number_and_name,
-                            "assembly_constituency_id": v.assembly_constituency_id,
-                            "assembly_constituency_name": v.assembly_constituency_name,
-                            "district": v.district,
-                            "state": v.state,
-                            "mandal_id": v.mandal_id,
-                            "district_id": v.district_id,
-                            "booth_id": v.booth_id,
-                            "user_id": str(v.user_id)
-                        }
-                        for v in voters
-                    ],
-                    "page": page,
-                    "limit": limit,
-                    "total": total,
-                    "totalPages": total_pages,
-                    "isLastPage": page >= total_pages,
-                }
-            )
-
         query = get_base_query(db, current_user)
 
+        query = apply_voter_filters(
+            query,
+            name=name,
+            epic=epic,
+            mobile=mobile,
+            state=state,
+            district_id=district_id,
+            mandal_id=mandal_id,
+            assembly_constituency_id=assembly_constituency_id,
+            booth_id=booth_id,
+            part_number=part_number,
+            search=search,
+        )
+
         total = query.count()
-        total_pages = math.ceil(total / limit) if limit > 0 else 1
+        total_pages = math.ceil(total / limit) if total else 0
+
+        query = _apply_sort(query, sort_by, sort_order)
 
         offset = (page - 1) * limit
         voters = query.offset(offset).limit(limit).all()
 
         return success_response(
             data={
-                "voters": [
-                    {
-                        "id": str(v.id),
-                        "name": v.name,
-                        "epic": v.epic,
-                        "mobile": v.mobile,
-                        "address": v.address,
-                        "serial_number": v.serial_number,
-                        "part_number_and_name": v.part_number_and_name,
-                        "assembly_constituency_id": v.assembly_constituency_id,
-                        "assembly_constituency_name": v.assembly_constituency_name,
-                        "district": v.district,
-                        "state": v.state,
-                        "mandal_id": v.mandal_id,
-                        "district_id": v.district_id,
-                        "booth_id": v.booth_id,
-                        "user_id": str(v.user_id)
-                    }
-                    for v in voters
-                ],
+                "voters": [_serialize_voter(v) for v in voters],
                 "page": page,
                 "limit": limit,
                 "total": total,
                 "totalPages": total_pages,
                 "isLastPage": page >= total_pages,
+                "appliedFilters": _collect_filters(
+                    name=name,
+                    epic=epic,
+                    mobile=mobile,
+                    search=search,
+                    state=state,
+                    district_id=district_id,
+                    mandal_id=mandal_id,
+                    assembly_constituency_id=assembly_constituency_id,
+                    booth_id=booth_id,
+                    part_number=part_number,
+                ),
             }
         )
 
@@ -313,57 +342,98 @@ def delete_voter_api(
     )
 @router.get("/count")
 def get_voter_count(
+    name: Optional[str] = Query(None),
+    epic: Optional[str] = Query(None),
+    mobile: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
+    district_id: Optional[int] = Query(None),
+    mandal_id: Optional[int] = Query(None),
+    assembly_constituency_id: Optional[int] = Query(None),
+    booth_id: Optional[int] = Query(None),
+    part_number: Optional[str] = Query(None),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user),
 ):
-    total = get_total_voters(db)
+    try:
+        query = get_base_query(db, current_user)
 
-    return success_response(
-        data={
-            "total_voters": total
-        }
-    )
+        query = apply_voter_filters(
+            query,
+            name=name,
+            epic=epic,
+            mobile=mobile,
+            state=state,
+            district_id=district_id,
+            mandal_id=mandal_id,
+            assembly_constituency_id=assembly_constituency_id,
+            booth_id=booth_id,
+            part_number=part_number,
+            search=search,
+        )
 
-from fastapi.responses import FileResponse
-from typing import Optional
-from fastapi import Query
+        return success_response(
+            data={
+                "total_voters": query.count(),
+                "appliedFilters": _collect_filters(
+                    name=name,
+                    epic=epic,
+                    mobile=mobile,
+                    search=search,
+                    state=state,
+                    district_id=district_id,
+                    mandal_id=mandal_id,
+                    assembly_constituency_id=assembly_constituency_id,
+                    booth_id=booth_id,
+                    part_number=part_number,
+                ),
+            }
+        )
+
+    except AppException:
+        raise
+
+    except Exception as e:
+        raise AppException(
+            status_code=500,
+            code="INTERNAL_SERVER_ERROR",
+            message=f"Something went wrong while counting voters: {str(e)}"
+        )
+
 
 @router.get("/export")
 def export_voters(
     name: Optional[str] = Query(None),
-    mobile: Optional[str] = Query(None),
     epic: Optional[str] = Query(None),
-    assembly_constituency_id: Optional[int] = Query(None),
+    mobile: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    state: Optional[str] = Query(None),
     district_id: Optional[int] = Query(None),
-
+    mandal_id: Optional[int] = Query(None),
+    assembly_constituency_id: Optional[int] = Query(None),
+    booth_id: Optional[int] = Query(None),
+    part_number: Optional[str] = Query(None),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user),
 ):
     query = get_base_query(db, current_user)
 
-    # -----------------------
-    # FILTERS (same as GET)
-    # -----------------------
-    if name:
-        query = query.filter(Voter.name.ilike(f"%{name}%"))
-
-    if mobile:
-        query = query.filter(Voter.mobile.ilike(f"%{mobile}%"))
-
-    if epic:
-        query = query.filter(Voter.epic.ilike(f"%{epic}%"))
-
-    if assembly_constituency_id:
-        query = query.filter(
-            Voter.assembly_constituency_id == assembly_constituency_id
-        )
-
-    if district_id:
-        query = query.filter(Voter.district_id == district_id)
+    query = apply_voter_filters(
+        query,
+        name=name,
+        epic=epic,
+        mobile=mobile,
+        state=state,
+        district_id=district_id,
+        mandal_id=mandal_id,
+        assembly_constituency_id=assembly_constituency_id,
+        booth_id=booth_id,
+        part_number=part_number,
+        search=search,
+    )
 
     voters = query.all()
 
-    # generate csv
     file_path = generate_csv(voters)
 
     return FileResponse(

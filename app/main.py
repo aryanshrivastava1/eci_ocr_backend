@@ -17,6 +17,7 @@ from app.db.base_model import *  # important
 
 from app.utils.exceptions import AppException
 from app.api.routes import voter
+from app.api.routes import geo
 
 
 app = FastAPI()
@@ -27,6 +28,7 @@ Base.metadata.create_all(bind=engine)
 app.include_router(auth.router, prefix="/auth", tags=["Auth"])
 app.include_router(ocr.router, prefix="/ocr", tags=["OCR"])
 app.include_router(voter.router, prefix="/voter", tags=["Voter"])
+app.include_router(geo.router, prefix="/geo", tags=["Geo"])
 
 
 @app.exception_handler(AppException)

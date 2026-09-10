@@ -1,0 +1,28 @@
+# Pramaan / ECI Qwen-VL OCR service — pinned for reproducibility.
+#
+# PyTorch is installed from the CUDA 12.4 wheel index. Change the cu124
+# suffix only if your driver requires a different CUDA runtime.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# --- ML runtime -------------------------------------------------------
+torch==2.5.1
+torchvision==0.20.1
+
+# Qwen2.5-VL is supported from transformers 4.49; 4.51.3 is a stable
+# release known to load Qwen/Qwen2.5-VL-7B-Instruct. Do not track git main.
+transformers==4.51.3
+accelerate==1.6.0
+
+# Chat-template / vision-input helper used by the OCR pipeline.
+qwen-vl-utils==0.0.10
+
+# --- API layer --------------------------------------------------------
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+
+# --- Image handling ---------------------------------------------------
+# headless: no GUI/libGL dependency, required for slim containers.
+opencv-python-headless==4.11.0.86
+pillow==11.1.0
+numpy==1.26.4

@@ -15,4 +15,9 @@ class Settings:
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY")
     QWEN_OCR_API_URL: str = os.getenv("QWEN_OCR_API_URL")
 
+    # Comma-separated list of allowed browser origins for the web frontend.
+    # "*" (the default) allows any origin; credentials are never allowed with
+    # "*", which is safe here because auth uses Authorization: Bearer, not cookies.
+    CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "*")
+
 settings = Settings()

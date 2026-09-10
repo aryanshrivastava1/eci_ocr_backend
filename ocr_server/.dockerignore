@@ -1,0 +1,83 @@
+# Secrets and credentials — must never enter the build context
+.env
+.env.*
+*.env
+secrets/
+credentials/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+*_rsa
+.netrc
+.npmrc
+.aws/
+.gcloud/
+gcloud-*.json
+service-account*.json
+*credentials*.json
+.huggingface/
+*token*
+
+# Notebooks (the Colab source contains an ngrok token)
+*.ipynb
+.ipynb_checkpoints/
+
+# Git
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Model weights / caches — mounted at run time, never copied in
+models/
+hub/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Application data that is not part of this service
+exports/
+debug/
+app/
+uploads/
+*.csv
+*.sqlite3
+*.log
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Docs
+README.md

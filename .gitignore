@@ -19,3 +19,10 @@ venv/
 
 # Database
 *.sqlite3
+
+# CSV exports (ephemeral, local disk only)
+exports/
+
+# Notebooks (the Colab OCR notebook contains a live ngrok token)
+*.ipynb
+.ipynb_checkpoints/

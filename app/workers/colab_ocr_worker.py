@@ -103,7 +103,15 @@ def process_job(job: Job, db: Session):
         # 4b. Resolve constituency against DB
         ac_raw = parsed.get("assembly_constituency", {}).get("value")
         if ac_raw:
-            ac_hindi, district_hi = resolve_constituency(db, ac_raw)
+            # Scope the lookup with the State/District the parser already
+            # extracted. Without this the match runs against all 3,551 ACs
+            # and can land on a same-named constituency in another State.
+            ac_hindi, district_hi = resolve_constituency(
+                db,
+                ac_raw,
+                state_name=parsed.get("state", {}).get("value"),
+                district_name=parsed.get("district", {}).get("value"),
+            )
             if ac_hindi:
                 parsed["assembly_constituency"]["value"] = ac_hindi
                 parsed["assembly_constituency"]["confidence"] = 0.99

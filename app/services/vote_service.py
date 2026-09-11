@@ -1,5 +1,7 @@
-from sqlalchemy import or_
+from sqlalchemy import or_, select
 
+from app.models.constituency import Constituency
+from app.models.states import State
 from app.models.voter import Voter
 from app.utils.exceptions import AppException
 
@@ -51,6 +53,9 @@ def apply_voter_filters(
     booth_id=None,
     part_number=None,
     search=None,
+    state_id=None,
+    state_code=None,
+    ac_number=None,
 ):
     """
     Apply user-supplied filters on top of an already role-scoped query.
@@ -77,9 +82,39 @@ def apply_voter_filters(
     if mandal_id is not None:
         query = query.filter(Voter.mandal_id == mandal_id)
 
+    # assembly_constituency_id is the LEGACY constituency.id that voters
+    # already store — it is deliberately NOT reinterpreted as an ECI
+    # ac_number. Existing callers keep their exact behaviour.
     if assembly_constituency_id is not None:
         query = query.filter(
             Voter.assembly_constituency_id == assembly_constituency_id
+        )
+
+    # --- hierarchy filters, added in Step 4D -------------------------------
+    # voters carries no state_id column, so a State/UT filter is expressed as
+    # "the voter's constituency belongs to this State". The subquery is
+    # evaluated in the database against ix_constituency_state_id; no row is
+    # fetched into Python to be filtered.
+    if state_id is not None or state_code is not None:
+        scope = select(Constituency.id)
+        if state_id is not None:
+            scope = scope.where(Constituency.state_id == state_id)
+        if state_code is not None:
+            scope = scope.join(
+                State, State.state_id == Constituency.state_id
+            ).where(State.state_code == str(state_code).strip())
+        query = query.filter(Voter.assembly_constituency_id.in_(scope))
+
+    # Official ECI AC number, offered SEPARATELY from assembly_constituency_id
+    # so the legacy filter keeps working. An AC number is only unique within a
+    # State/UT, so combine it with state_id/state_code for an exact match;
+    # on its own it matches that AC number in every loaded State/UT, which is
+    # the correct AND semantics for an independent filter.
+    if ac_number is not None:
+        query = query.filter(
+            Voter.assembly_constituency_id.in_(
+                select(Constituency.id).where(Constituency.ac_number == ac_number)
+            )
         )
 
     if booth_id is not None:

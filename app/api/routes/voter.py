@@ -21,6 +21,7 @@ from app.utils.success_response import success_response
 from app.utils.exceptions import AppException
 from app.schemas.voter_update_request import VoterUpdateRequest
 from app.repositories.voter_repo import create_voter, delete_voter, get_total_voters, update_voter
+from app.core import constituency_resolver
 
 router = APIRouter()
 
@@ -99,9 +100,29 @@ def get_voters(
     state: Optional[str] = Query(None),
     district_id: Optional[int] = Query(None),
     mandal_id: Optional[int] = Query(None),
-    assembly_constituency_id: Optional[int] = Query(None),
+    assembly_constituency_id: Optional[int] = Query(
+        None,
+        description=(
+            "Legacy database constituency.id that voters already reference. "
+            "This is NOT the ECI AC number - use ac_number for that."
+        ),
+    ),
     booth_id: Optional[int] = Query(None),
     part_number: Optional[str] = Query(None),
+    state_id: Optional[int] = Query(
+        None, description="Restrict to voters whose constituency is in this State/UT."
+    ),
+    state_code: Optional[str] = Query(
+        None, description='Same as state_id but by LGD State Code, e.g. "9".'
+    ),
+    ac_number: Optional[int] = Query(
+        None,
+        description=(
+            "Official ECI Assembly Constituency number. Combine with "
+            "state_id/state_code for an exact match - an AC number is only "
+            "unique within a State/UT."
+        ),
+    ),
     sort_by: str = Query("name"),
     sort_order: str = Query("asc"),
     page: int = Query(1, ge=1),
@@ -124,6 +145,9 @@ def get_voters(
             booth_id=booth_id,
             part_number=part_number,
             search=search,
+            state_id=state_id,
+            state_code=state_code,
+            ac_number=ac_number,
         )
 
         total = query.count()
@@ -153,6 +177,9 @@ def get_voters(
                     assembly_constituency_id=assembly_constituency_id,
                     booth_id=booth_id,
                     part_number=part_number,
+                    state_id=state_id,
+                    state_code=state_code,
+                    ac_number=ac_number,
                 ),
             }
         )
@@ -173,8 +200,6 @@ def create_voter_api(
     db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
-    from sqlalchemy import or_, func
-
     try:
         if not payload.assembly_constituency_name:
             raise AppException(
@@ -184,20 +209,46 @@ def create_voter_api(
                 field="assembly_constituency_name"
             )
 
-        name = payload.assembly_constituency_name.strip().lower()
-
-        constituency = (
-            db.query(Constituency)
-            .filter(
-                or_(
-                    func.lower(Constituency.constituency_hindi) == name,
-                    func.lower(Constituency.constituency) == name
-                )
-            )
-            .first()
+        # Scoped resolution. The previous implementation matched
+        # lower(constituency name) across the whole table and took .first(),
+        # which -- now that 3,551 ACs are loaded and 83 English AC names are
+        # duplicated across states -- could silently attach the voter to a
+        # same-named constituency in the wrong State. The resolver narrows by
+        # State and District first and refuses to break a tie.
+        resolution = constituency_resolver.resolve(
+            db,
+            payload.assembly_constituency_name,
+            state_code=payload.state_code,
+            state_name=payload.state,
+            district_lgd_code=payload.district_lgd_code,
+            district_name=payload.district,
         )
 
-        if not constituency:
+        if not resolution.resolved:
+            if resolution.status == constituency_resolver.UNRESOLVED_NOT_FOUND:
+                raise AppException(
+                    status_code=400,
+                    code="INVALID_CONSTITUENCY",
+                    message="Invalid assembly constituency",
+                    field="assembly_constituency_name"
+                )
+            # Ambiguous, too broad, or a state/district contradiction. Tell the
+            # caller what to supply instead of choosing a State for them.
+            raise AppException(
+                status_code=400,
+                code="AMBIGUOUS_CONSTITUENCY",
+                message=(
+                    "Assembly constituency could not be resolved "
+                    "unambiguously: %s. Supply %s to disambiguate."
+                    % (resolution.reason,
+                       " or ".join(resolution.required) or "a State/UT")
+                ),
+                field="assembly_constituency_name",
+                data=resolution.to_dict(),
+            )
+
+        constituency = db.get(Constituency, resolution.match.constituency_id)
+        if constituency is None:
             raise AppException(
                 status_code=400,
                 code="INVALID_CONSTITUENCY",
@@ -349,9 +400,29 @@ def get_voter_count(
     state: Optional[str] = Query(None),
     district_id: Optional[int] = Query(None),
     mandal_id: Optional[int] = Query(None),
-    assembly_constituency_id: Optional[int] = Query(None),
+    assembly_constituency_id: Optional[int] = Query(
+        None,
+        description=(
+            "Legacy database constituency.id that voters already reference. "
+            "This is NOT the ECI AC number - use ac_number for that."
+        ),
+    ),
     booth_id: Optional[int] = Query(None),
     part_number: Optional[str] = Query(None),
+    state_id: Optional[int] = Query(
+        None, description="Restrict to voters whose constituency is in this State/UT."
+    ),
+    state_code: Optional[str] = Query(
+        None, description='Same as state_id but by LGD State Code, e.g. "9".'
+    ),
+    ac_number: Optional[int] = Query(
+        None,
+        description=(
+            "Official ECI Assembly Constituency number. Combine with "
+            "state_id/state_code for an exact match - an AC number is only "
+            "unique within a State/UT."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -370,6 +441,9 @@ def get_voter_count(
             booth_id=booth_id,
             part_number=part_number,
             search=search,
+            state_id=state_id,
+            state_code=state_code,
+            ac_number=ac_number,
         )
 
         return success_response(
@@ -386,6 +460,9 @@ def get_voter_count(
                     assembly_constituency_id=assembly_constituency_id,
                     booth_id=booth_id,
                     part_number=part_number,
+                    state_id=state_id,
+                    state_code=state_code,
+                    ac_number=ac_number,
                 ),
             }
         )
@@ -410,9 +487,29 @@ def export_voters(
     state: Optional[str] = Query(None),
     district_id: Optional[int] = Query(None),
     mandal_id: Optional[int] = Query(None),
-    assembly_constituency_id: Optional[int] = Query(None),
+    assembly_constituency_id: Optional[int] = Query(
+        None,
+        description=(
+            "Legacy database constituency.id that voters already reference. "
+            "This is NOT the ECI AC number - use ac_number for that."
+        ),
+    ),
     booth_id: Optional[int] = Query(None),
     part_number: Optional[str] = Query(None),
+    state_id: Optional[int] = Query(
+        None, description="Restrict to voters whose constituency is in this State/UT."
+    ),
+    state_code: Optional[str] = Query(
+        None, description='Same as state_id but by LGD State Code, e.g. "9".'
+    ),
+    ac_number: Optional[int] = Query(
+        None,
+        description=(
+            "Official ECI Assembly Constituency number. Combine with "
+            "state_id/state_code for an exact match - an AC number is only "
+            "unique within a State/UT."
+        ),
+    ),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
@@ -430,6 +527,9 @@ def export_voters(
         booth_id=booth_id,
         part_number=part_number,
         search=search,
+        state_id=state_id,
+        state_code=state_code,
+        ac_number=ac_number,
     )
 
     voters = query.all()

@@ -63,7 +63,9 @@ async def app_exception_handler(request: Request, exc: AppException):
             "error": {
                 "code": exc.code,
                 "message": exc.message,
-                "field": exc.field
+                "field": exc.field,
+                # only when the raiser supplies it, so other errors keep their shape
+                **({"data": exc.data} if exc.data is not None else {}),
             }
         }
     )

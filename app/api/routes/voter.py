@@ -222,6 +222,8 @@ def create_voter_api(
             state_name=payload.state,
             district_lgd_code=payload.district_lgd_code,
             district_name=payload.district,
+            ac_number=payload.ac_number,
+            constituency_id=payload.assembly_constituency_id,
         )
 
         if not resolution.resolved:
@@ -245,6 +247,26 @@ def create_voter_api(
                 ),
                 field="assembly_constituency_name",
                 data=resolution.to_dict(),
+            )
+
+        # A fuzzy score is a guess, not a confirmation. Only an exact name,
+        # a sourced alias, or a verified id / AC number may be saved; this
+        # also stops raw OCR text from being fuzzy-matched again here.
+        if resolution.method == "fuzzy":
+            m = resolution.match
+            suggestion = m.constituency_hindi or m.constituency
+            raise AppException(
+                status_code=400,
+                code="CONSTITUENCY_CONFIRMATION_REQUIRED",
+                message=(
+                    "Assembly constituency %r was not found exactly. Did you "
+                    "mean %r (AC %s)? Confirm it by sending its exact name or "
+                    "assembly_constituency_id %s."
+                    % (payload.assembly_constituency_name, suggestion,
+                       m.ac_number, m.constituency_id)
+                ),
+                field="assembly_constituency_name",
+                data={"suggestion": m.brief(), "score": resolution.score},
             )
 
         constituency = db.get(Constituency, resolution.match.constituency_id)
@@ -283,9 +305,16 @@ def create_voter_api(
         data = payload.model_dump()
 
         data.pop("assembly_constituency_name", None)
+        # Resolution inputs, not Voter columns: Voter(**data) rejects them.
+        for key in ("state_code", "district_lgd_code", "ac_number"):
+            data.pop(key, None)
 
         data["assembly_constituency_id"] = constituency.id
-        data["assembly_constituency_name"] = constituency.constituency_hindi
+        # The resolved row's own English name when no authoritative Hindi
+        # exists (3,542 of 3,551 ACs) -- never NULL, never the raw input.
+        data["assembly_constituency_name"] = (
+            constituency.constituency_hindi or constituency.constituency
+        )
 
         data["district_id"] = constituency.district_id
         data["mandal_id"] = district.mandala_id if district else None

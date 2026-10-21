@@ -24,3 +24,8 @@ class VoterCreate(BaseModel):
     #   district_lgd_code = LGD District Code as TEXT, e.g. "162" for Lucknow
     state_code: str | None = None
     district_lgd_code: str | None = None
+    # Optional confirmations of the name, never replacements for it:
+    #   assembly_constituency_id = constituency.id the OCR step resolved
+    #   ac_number                = official ECI AC number (needs a state)
+    assembly_constituency_id: int | None = None
+    ac_number: int | None = None

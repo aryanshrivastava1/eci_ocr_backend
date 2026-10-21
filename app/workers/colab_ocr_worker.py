@@ -1,5 +1,4 @@
 import os
-import re
 import signal
 import cv2
 import numpy as np
@@ -12,7 +11,7 @@ from app.db.base_model import *
 
 from app.core.image_processing import download_image, crop_rois
 from app.core.smart_parser import parse_smart
-from app.core.constituency_resolver import resolve_constituency
+from app.core.constituency_resolver import resolve_parsed_constituency
 
 import threading
 
@@ -101,27 +100,8 @@ def process_job(job: Job, db: Session):
             print("⚠️ Parser: name not found (partial result saved)")
 
         # 4b. Resolve constituency against DB
-        ac_raw = parsed.get("assembly_constituency", {}).get("value")
-        if ac_raw:
-            # Scope the lookup with the State/District the parser already
-            # extracted. Without this the match runs against all 3,551 ACs
-            # and can land on a same-named constituency in another State.
-            ac_hindi, district_hi = resolve_constituency(
-                db,
-                ac_raw,
-                state_name=parsed.get("state", {}).get("value"),
-                district_name=parsed.get("district", {}).get("value"),
-            )
-            if ac_hindi:
-                parsed["assembly_constituency"]["value"] = ac_hindi
-                parsed["assembly_constituency"]["confidence"] = 0.99
-                if district_hi and not parsed.get("district", {}).get("value"):
-                    district_hi = re.sub(r"^जिल[ाेोां]*\s*[:：]?\s*", "", district_hi).strip()
-                    parsed.setdefault("district", {})["value"] = district_hi
-                    parsed["district"]["confidence"] = 0.99
-            else:
-                parsed["assembly_constituency"]["value"] = None
-                parsed["assembly_constituency"]["confidence"] = 0.0
+        # Unconfirmed matches keep the OCR text with low confidence.
+        resolve_parsed_constituency(db, parsed)
 
         # 5. Persist result
         job.status = "completed"

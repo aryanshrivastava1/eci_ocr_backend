@@ -27,13 +27,16 @@ never writes to any table.
 
 from __future__ import annotations
 
+import csv
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Optional
 
 from rapidfuzz import fuzz, process
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.constituency import Constituency
@@ -56,6 +59,19 @@ UNRESOLVED_NOT_FOUND = "unresolved_not_found"
 UNRESOLVED_AMBIGUOUS = "unresolved_ambiguous"
 UNRESOLVED_SCOPE_REQUIRED = "unresolved_scope_required"
 UNRESOLVED_SCOPE_CONFLICT = "unresolved_scope_conflict"
+UNRESOLVED_REFERENCE_UNAVAILABLE = "unresolved_reference_unavailable"
+UNRESOLVED_UNVERIFIED = "unresolved_unverified"
+
+# "174 - लखनऊ मध्य", "174-Lucknow Central", "174. X" -> (174, name)
+_AC_NUMBER_PREFIX = re.compile(r"^\s*(\d{1,3})\s*[-–—.:)]?\s*(\D.*)$", re.S)
+# Worker-only status: a fuzzy match, offered as a suggestion. A fuzzy score
+# alone never overwrites the OCR text, whatever the score (a short AC name
+# inside a longer one scores 100: "शिमला गरामीण" -> "शिमला").
+WEAK_MATCH = "weak_match"
+
+# Confidence given to an OCR value the resolver could not confirm. Below the
+# 0.6 the Flutter form uses to flag a field for review.
+_UNCONFIRMED_CONFIDENCE = 0.3
 
 # Devanagari label prefixes the OCR text often carries, e.g.
 # "जिला : लखनऊ" or "विधान सभा निर्वाचन क्षेत्र". Stripped for comparison only;
@@ -81,6 +97,27 @@ def _norm(value: Optional[str]) -> str:
     text = unicodedata.normalize("NFC", str(value))
     text = re.sub(r"\s+", " ", text).strip()
     return text.casefold()
+
+
+_ALIASES_CSV = os.path.join(os.path.dirname(__file__), "..", "..", "data",
+                            "reference", "source", "name_aliases.csv")
+
+
+@lru_cache(maxsize=1)
+def _aliases() -> dict:
+    """Sourced name aliases: {(kind, normalised alias): {target, ...}}.
+
+    kind "state" -> LGD state_code; kind "constituency" -> (state_code,
+    ac_number). A set with more than one target is ambiguous by definition.
+    Every row cites its source in name_aliases.csv; nothing is generated.
+    """
+    out: dict = {}
+    with open(_ALIASES_CSV, encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            target = (r["state_code"] if r["kind"] == "state"
+                      else (r["state_code"], int(r["ac_number"])))
+            out.setdefault((r["kind"], _norm(r["alias"])), set()).add(target)
+    return out
 
 
 def _is_devanagari(value: Optional[str]) -> bool:
@@ -219,12 +256,17 @@ def resolve_state(
         ).scalars().first()
         if row:
             return row, "state from name"
-        if _is_devanagari(state_name):
-            return None, (
-                "state name is Devanagari and states.state_name_hi is not "
-                "populated, so it cannot scope the lookup"
-            )
-        return None, "state name %r did not match any State/UT" % state_name
+        codes = _aliases().get(("state", target), set())
+        if len(codes) > 1:
+            return None, "alias %r maps to several States/UTs" % state_name
+        if codes:
+            row = db.execute(
+                select(State).where(State.state_code == next(iter(codes)))
+            ).scalars().first()
+            if row:
+                return row, "state from sourced alias"
+        return None, ("state name %r matched no State/UT name or sourced alias"
+                      % state_name)
 
     return None, None
 
@@ -380,7 +422,28 @@ def _exact_matches(db: Session, name: str, scope: Scope) -> list[Candidate]:
         ),
         scope,
     )
-    return _rows_to_candidates(db.execute(stmt).all())
+    found = _rows_to_candidates(db.execute(stmt).all())
+    # Sourced aliases add their targets inside the same scope; they never
+    # replace a canonical hit, so a collision surfaces as ambiguity.
+    targets = _aliases().get(("constituency", target))
+    if targets:
+        alias_stmt = _apply_scope(_base_query().where(or_(*(
+            and_(State.state_code == sc, Constituency.ac_number == ac)
+            for sc, ac in targets))), scope)
+        seen = {c.constituency_id for c in found}
+        found += [c for c in _rows_to_candidates(db.execute(alias_stmt).all())
+                  if c.constituency_id not in seen]
+    return found
+
+
+def _hindi_gap(db: Session, scope: Scope) -> int:
+    """How many ACs in the scope have no authoritative Hindi name."""
+    stmt = _apply_scope(
+        select(func.count()).select_from(Constituency)
+        .where(Constituency.constituency_hindi.is_(None)),
+        scope,
+    )
+    return db.execute(stmt).scalar_one()
 
 
 def _fuzzy_pool(db: Session, name: str, scope: Scope) -> tuple[list[Candidate], Optional[str]]:
@@ -423,6 +486,19 @@ def _fuzzy_pool(db: Session, name: str, scope: Scope) -> tuple[list[Candidate], 
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def split_ac_number(value: Optional[str]) -> tuple[str, Optional[int]]:
+    """'174 - लखनऊ मध्य' -> ('लखनऊ मध्य', 174). No prefix -> (value, None)."""
+    m = _AC_NUMBER_PREFIX.match(value or "")
+    if not m:
+        return (value or "").strip(), None
+    return m.group(2).strip(), int(m.group(1))
+
+
+def _conflict(scope: Scope, reason: str) -> Resolution:
+    return Resolution(status=UNRESOLVED_SCOPE_CONFLICT, scope=scope,
+                      reason=reason, required=["assembly_constituency_id"])
+
+
 def resolve(
     db: Session,
     constituency_name: Optional[str],
@@ -430,9 +506,17 @@ def resolve(
     state_name: Optional[str] = None,
     district_lgd_code: Optional[str] = None,
     district_name: Optional[str] = None,
+    ac_number: Optional[int] = None,
+    constituency_id: Optional[int] = None,
 ) -> Resolution:
-    """Resolve a constituency name within the strongest available scope."""
-    cleaned = _strip_prefix(constituency_name, _AC_PREFIX)
+    """Resolve a constituency within the strongest available scope.
+
+    A leading AC number in the name ("174 - लखनऊ मध्य") is split off. An AC
+    number (with a known state) or a constituency id only ever *confirms* or
+    *disambiguates* the name; when they disagree, or the name cannot be
+    verified, nothing is resolved.
+    """
+    cleaned, prefix_no = split_ac_number(_strip_prefix(constituency_name, _AC_PREFIX))
     scope = build_scope(db, state_code, state_name,
                         district_lgd_code, district_name)
 
@@ -442,7 +526,64 @@ def resolve(
             reason=scope.conflict,
             required=["state_code", "district_lgd_code"],
         )
+    if ac_number is not None and prefix_no is not None and ac_number != prefix_no:
+        return _conflict(scope, "ac_number %s contradicts the %s in the name"
+                         % (ac_number, prefix_no))
+    if ac_number is None:
+        ac_number = prefix_no
 
+    by_name = _resolve_name(db, cleaned, scope)
+
+    # ---- identifiers: only with a constituency_id, or an AC number in a known state
+    rows: list[Candidate] = []
+    if constituency_id is not None:
+        rows = _rows_to_candidates(db.execute(
+            _apply_scope(_base_query().where(Constituency.id == constituency_id), scope)
+        ).all())
+        if not rows:
+            return _conflict(scope, "constituency_id %s does not exist within %s "
+                             "scope" % (constituency_id, scope.level))
+    if ac_number is not None and scope.state_id is not None:
+        by_no = _rows_to_candidates(db.execute(
+            _apply_scope(_base_query().where(Constituency.ac_number == ac_number), scope)
+        ).all())
+        if not by_no:
+            return _conflict(scope, "AC %s does not exist within %s scope"
+                             % (ac_number, scope.level))
+        if rows and rows[0].constituency_id != by_no[0].constituency_id:
+            return _conflict(scope, "constituency_id %s is not AC %s"
+                             % (constituency_id, ac_number))
+        rows = by_no
+    if not rows:
+        return by_name
+
+    row = rows[0]
+    if by_name.resolved:
+        if by_name.match.constituency_id == row.constituency_id:
+            by_name.reason += "; confirmed by identifier"
+            if by_name.method == "fuzzy":
+                # The identifier, not the fuzzy score, is what verifies it.
+                by_name.method = "identifier"
+            return by_name
+        return _conflict(scope, "name resolves to AC %s but the identifier is AC %s"
+                         % (by_name.match.ac_number, row.ac_number))
+    if any(c.constituency_id == row.constituency_id for c in by_name.candidates):
+        return Resolution(status=RESOLVED, scope=scope, match=row,
+                          method="identifier", score=by_name.score,
+                          reason="identifier selected one of %d same-named "
+                                 "constituencies" % len(by_name.candidates))
+    # The name cannot confirm the identifier (e.g. no Hindi reference data).
+    # Offer the row for review; an OCR'd digit is not proof on its own.
+    return Resolution(status=UNRESOLVED_UNVERIFIED, scope=scope, candidates=[row],
+                      method="identifier",
+                      reason="identifier points to %r but the name %r could not "
+                             "confirm it (%s)" % (row.constituency, cleaned,
+                                                  by_name.status),
+                      required=["assembly_constituency_name"])
+
+
+def _resolve_name(db: Session, cleaned: str, scope: Scope) -> Resolution:
+    """Name-only resolution inside an already-built scope."""
     if not cleaned:
         return Resolution(
             status=UNRESOLVED_NOT_FOUND, scope=scope,
@@ -468,6 +609,21 @@ def resolve(
         )
 
     # ---- 4. fuzzy match, inside the scope only
+    # Devanagari fuzzy is only safe where every AC in the scope has an
+    # authoritative Hindi name. Otherwise the pool silently shrinks to the few
+    # rows that do, and "आगरा उत्तर" fuzzy-matches "लखनऊ उत्तर".
+    if _is_devanagari(cleaned):
+        gap = _hindi_gap(db, scope)
+        if gap:
+            return Resolution(
+                status=UNRESOLVED_REFERENCE_UNAVAILABLE, scope=scope,
+                method="fuzzy",
+                reason=("%d constituencies within %s scope have no "
+                        "authoritative Hindi name, so a Devanagari fuzzy "
+                        "match cannot be trusted" % (gap, scope.level)),
+                required=["district_lgd_code"],
+            )
+
     pool, why = _fuzzy_pool(db, cleaned, scope)
     if why:
         return Resolution(status=UNRESOLVED_SCOPE_REQUIRED, scope=scope,
@@ -587,3 +743,53 @@ def resolve_constituency(
           % (raw_value, m.constituency_hindi or m.constituency, result.method,
              result.score, result.scope.level, m.state_code, m.ac_number))
     return (m.constituency_hindi or m.constituency), m.district_name_hi
+
+
+# ---------------------------------------------------------------------------
+# OCR worker entry point
+# ---------------------------------------------------------------------------
+
+def resolve_parsed_constituency(db: Session, parsed: dict) -> None:
+    """Resolve parsed["assembly_constituency"] in place, for both OCR workers.
+
+    The OCR text is never replaced by null or by a weak/ambiguous guess: an
+    unconfirmed value keeps the OCR text with low confidence. The field gains
+    `raw_value` (the OCR text) and `resolution_status`. Only the constituency
+    field, and an empty district, are touched.
+    """
+    field = parsed.get("assembly_constituency")
+    raw = field.get("value") if field else None
+    if not raw:
+        return
+
+    result = resolve(
+        db, raw,
+        state_name=(parsed.get("state") or {}).get("value"),
+        district_name=(parsed.get("district") or {}).get("value"),
+    )
+    field["raw_value"] = raw
+    m = result.match
+    status = result.status
+    if result.resolved and result.method == "fuzzy":
+        status = WEAK_MATCH
+        field["suggested_value"] = m.constituency_hindi or m.constituency
+    elif status == UNRESOLVED_UNVERIFIED:
+        c = result.candidates[0]
+        field["suggested_value"] = c.constituency_hindi or c.constituency
+    field["resolution_status"] = status
+    print(ascii("[constituency_resolver] %s -> %s: %s" % (raw, status, result.reason)))
+
+    if status != RESOLVED:
+        field["value"] = raw
+        field["confidence"] = _UNCONFIRMED_CONFIDENCE
+        return
+
+    field["value"] = m.constituency_hindi or m.constituency
+    field["confidence"] = 0.99
+    # Lets the client send the confirmed id back on save (unless edited).
+    field["constituency_id"] = m.constituency_id
+    if m.district_name_hi and not (parsed.get("district") or {}).get("value"):
+        parsed["district"] = {
+            "value": re.sub(r"^जिल[ाेोां]*\s*[:：]?\s*", "", m.district_name_hi).strip(),
+            "confidence": 0.99,
+        }
